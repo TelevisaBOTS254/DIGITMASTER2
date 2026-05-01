@@ -1,4 +1,4 @@
-// server.js – Higher/Lower Dual Bot on a fixed schedule
+// server.js – Higher/Lower Dual Bot on fixed schedule, only during high volatility
 const WebSocket = require('ws');
 const http = require('http');
 
@@ -7,17 +7,23 @@ const TOKEN  = process.env.DERIV_TOKEN || '';
 const SYMBOL = process.env.SYMBOL     || 'R_10';
 const STAKE  = parseFloat(process.env.STAKE  || '1');
 const OFFSET = process.env.OFFSET     || '0.06';
-const INTERVAL_SEC = parseInt(process.env.INTERVAL_SEC || '60'); // schedule interval
+const INTERVAL_SEC = parseInt(process.env.INTERVAL_SEC || '60');
+
+// Volatility analysis settings
+const VOLATILITY_THRESHOLD = parseFloat(process.env.VOLATILITY_THRESHOLD || '0.02'); // standard deviation threshold
+const TICK_BUFFER_SIZE     = parseInt(process.env.TICK_BUFFER_SIZE || '30');        // number of recent ticks to use
+const MIN_TICKS_REQUIRED   = parseInt(process.env.MIN_TICKS_REQUIRED || '20');     // how many ticks needed before trading
 
 // ---------- WebSocket & state ----------
 let ws = null;
-let latestSpot = null;    // always holds the most recent tick price
+let latestSpot = null;        // most recent tick price
+let tickBuffer = [];          // rolling array of recent tick prices (number)
 
 // ---------- HTTP health server ----------
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200);
-  res.end('Bot is running on fixed schedule');
+  res.end('Bot is running with volatility filter');
 }).listen(PORT, () => {
   console.log(`Health check on port ${PORT}`);
 });
@@ -53,9 +59,16 @@ function connect() {
       ws.send(JSON.stringify({ ticks: SYMBOL }));
     }
 
-    // Keep latestSpot always up‑to‑date
+    // Tick handler – update latestSpot and rolling buffer
     if (msg.msg_type === 'tick') {
-      latestSpot = msg.tick.quote;
+      const spot = parseFloat(msg.tick.quote);
+      latestSpot = spot;
+
+      // Maintain rolling buffer
+      tickBuffer.push(spot);
+      if (tickBuffer.length > TICK_BUFFER_SIZE) {
+        tickBuffer.shift(); // remove oldest
+      }
     }
 
     // Trade confirmation
@@ -79,20 +92,40 @@ function connect() {
   });
 }
 
-// ---------- Fixed schedule: fire exactly every INTERVAL_SEC seconds ----------
+// ---------- Fixed schedule: fire at intervals, but only if volatile ----------
 function startScheduler() {
   setInterval(() => {
-    // Only trade if we have a valid price (ticks have started arriving)
+    // 1. Do we have a current price?
     if (latestSpot === null) {
-      log('⏳ No tick received yet – skipping trade this cycle');
+      log('⏳ No tick yet – skipping trade');
       return;
     }
 
-    // Round to 2 decimals as required by Deriv API
-    const entryPrice = Math.round(parseFloat(latestSpot) * 100) / 100;
-    log(`⏰ Scheduled trade – Spot: ${latestSpot} → Entry: ${entryPrice}`);
+    // 2. Do we have enough ticks for analysis?
+    if (tickBuffer.length < MIN_TICKS_REQUIRED) {
+      log(`⏳ Not enough ticks (${tickBuffer.length}/${MIN_TICKS_REQUIRED}) – skipping`);
+      return;
+    }
 
+    // 3. Calculate standard deviation
+    const mean = tickBuffer.reduce((sum, v) => sum + v, 0) / tickBuffer.length;
+    const sqDiffs = tickBuffer.map(v => (v - mean) ** 2);
+    const variance = sqDiffs.reduce((sum, v) => sum + v, 0) / tickBuffer.length;
+    const stdDev = Math.sqrt(variance);
+
+    log(`📊 Volatility (std dev): ${stdDev.toFixed(6)} | Threshold: ${VOLATILITY_THRESHOLD}`);
+
+    // 4. Decide
+    if (stdDev < VOLATILITY_THRESHOLD) {
+      log('😴 Volatility too low – skipping trade');
+      return;
+    }
+
+    // 5. Fire trade pair
+    const entryPrice = Math.round(latestSpot * 100) / 100;
+    log(`⚡ High volatility! Entry: ${entryPrice}`);
     placeContracts(entryPrice);
+
   }, INTERVAL_SEC * 1000);
 }
 
@@ -107,14 +140,12 @@ function placeContracts(entryPrice) {
     amount: STAKE
   };
 
-  // Higher
   ws.send(JSON.stringify({
     buy: 1,
     price: entryPrice,
     parameters: { ...base, contract_type: 'CALL', barrier: `+${OFFSET}` }
   }));
 
-  // Lower
   ws.send(JSON.stringify({
     buy: 1,
     price: entryPrice,
@@ -122,11 +153,11 @@ function placeContracts(entryPrice) {
   }));
 }
 
-// ---------- Start everything ----------
+// ---------- Start ----------
 if (!TOKEN) {
   log('❌ DERIV_TOKEN missing. Exiting.');
   process.exit(1);
 }
 
 connect();
-startScheduler(); // the scheduler runs independently of connection state
+startScheduler();
