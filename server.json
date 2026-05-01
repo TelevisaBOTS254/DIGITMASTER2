@@ -1,330 +1,132 @@
-require('dotenv').config();
+// server.js – Higher/Lower Dual Bot on a fixed schedule
 const WebSocket = require('ws');
-const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
-const path = require('path');
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' },
-  transports: ['websocket', 'polling']
-});
+// ---------- Configuration (set in Railway environment) ----------
+const TOKEN  = process.env.DERIV_TOKEN || '';
+const SYMBOL = process.env.SYMBOL     || 'R_10';
+const STAKE  = parseFloat(process.env.STAKE  || '1');
+const OFFSET = process.env.OFFSET     || '0.06';
+const INTERVAL_SEC = parseInt(process.env.INTERVAL_SEC || '60'); // schedule interval
 
+// ---------- WebSocket & state ----------
+let ws = null;
+let latestSpot = null;    // always holds the most recent tick price
+
+// ---------- HTTP health server ----------
 const PORT = process.env.PORT || 3000;
-const APP_ID = 1089;
-const DERIV_TOKEN = process.env.DERIV_TOKEN || '';
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Bot is running on fixed schedule');
+}).listen(PORT, () => {
+  console.log(`Health check on port ${PORT}`);
+});
 
-const SYMBOL = 'R_100';
-
-// 🔥 MARTINGALE SETTINGS
-const MARTINGALE_STEPS = [1, 2, 4, 8, 16];
-const MAX_STEPS = MARTINGALE_STEPS.length;
-const TP_TARGET = 5.0;
-
-// 🕒 SESSION CONTROL
-const START_HOUR = 10;
-const START_MINUTE = 0;
-const TRADE_WINDOW_MINUTES = 30;
-
-// 🔄 COOLDOWN AFTER LOSS
-let cooldown = 0;
-
-let hasTradedToday = false;
-let lastTradeDay = null;
-
-let state = {
-  running: false,
-  inTrade: false,
-  pnl: 0,
-
-  wins: 0,
-  losses: 0,
-
-  stepIndex: 0,
-  stake: MARTINGALE_STEPS[0],
-
-  history: [],
-  statsBuffer: [],
-  quote: null,
-  lastDigit: null,
-  pipSize: 2,
-
-  symbol: SYMBOL,
-  cooldown: 0,
-
-  session: {
-    startHour: START_HOUR,
-    startMinute: START_MINUTE,
-    windowMinutes: TRADE_WINDOW_MINUTES,
-    withinWindow: false,
-    canTradeNow: false,
-    hasTradedToday: false,
-    label: `${String(START_HOUR).padStart(2, '0')}:${String(START_MINUTE).padStart(2, '0')} - ${String(START_HOUR).padStart(2, '0')}:${String(START_MINUTE + TRADE_WINDOW_MINUTES).padStart(2, '0')}`
-  }
-};
-
-let derivWs = null;
-let pendingProposal = null;
-
-function round2(v) {
-  return Math.round(v * 100) / 100;
+// ---------- Logging ----------
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-function emitState() {
-  refreshRuntimeState();
-  io.emit('update', state);
-}
-
-function pushLog(message, level = 'info') {
-  io.emit('log', {
-    ts: new Date().toISOString(),
-    level,
-    message
-  });
-}
-
-function getLastDigit(price, pipSize) {
-  const factor = Math.pow(10, pipSize);
-  return Math.round(price * factor) % 10;
-}
-
-function getDigitPercent(digit) {
-  const counts = Array(10).fill(0);
-  state.statsBuffer.forEach((d) => counts[d]++);
-  const total = state.statsBuffer.length || 1;
-  return (counts[digit] / total) * 100;
-}
-
-function getSessionSnapshot() {
-  const now = new Date();
-
-  const currentDay = now.toDateString();
-  const hours = now.getHours();
-  const minutes = now.getMinutes();
-
-  if (lastTradeDay !== currentDay) {
-    hasTradedToday = false;
-    lastTradeDay = currentDay;
-  }
-
-  const currentTotalMinutes = hours * 60 + minutes;
-  const startTotalMinutes = START_HOUR * 60 + START_MINUTE;
-  const endTotalMinutes = startTotalMinutes + TRADE_WINDOW_MINUTES;
-
-  const withinWindow =
-    currentTotalMinutes >= startTotalMinutes &&
-    currentTotalMinutes < endTotalMinutes;
-
-  return {
-    startHour: START_HOUR,
-    startMinute: START_MINUTE,
-    windowMinutes: TRADE_WINDOW_MINUTES,
-    withinWindow,
-    canTradeNow: !hasTradedToday && withinWindow,
-    hasTradedToday,
-    label: `${String(START_HOUR).padStart(2, '0')}:${String(START_MINUTE).padStart(2, '0')} - ${String(Math.floor(endTotalMinutes / 60)).padStart(2, '0')}:${String(endTotalMinutes % 60).padStart(2, '0')}`
-  };
-}
-
-function refreshRuntimeState() {
-  state.cooldown = cooldown;
-  state.session = getSessionSnapshot();
-  state.symbol = SYMBOL;
-}
-
+// ---------- Connect & auto‑reconnect ----------
 function connect() {
-  derivWs = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`);
+  if (ws && ws.readyState === WebSocket.OPEN) return;
 
-  derivWs.on('open', () => {
-    pushLog('Connected to Deriv socket', 'success');
-    derivWs.send(JSON.stringify({ authorize: DERIV_TOKEN }));
+  log('Connecting to Deriv...');
+  ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089');
+
+  ws.on('open', () => {
+    log('Connected. Authorizing...');
+    ws.send(JSON.stringify({ authorize: TOKEN }));
   });
 
-  derivWs.on('message', (raw) => {
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return;
-    }
+  ws.on('message', (data) => {
+    const msg = JSON.parse(data.toString());
 
-    if (data.error) {
-      pushLog(`${data.error.message || 'Deriv error'}`, 'error');
-      return;
-    }
-
-    if (data.msg_type === 'authorize') {
-      derivWs.send(JSON.stringify({ active_symbols: 'brief' }));
-    }
-
-    else if (data.msg_type === 'active_symbols') {
-      derivWs.send(JSON.stringify({ ticks: SYMBOL, subscribe: 1 }));
-      state.running = true;
-      pushLog(`Bot started on ${SYMBOL}`, 'success');
-      emitState();
-    }
-
-    else if (data.msg_type === 'tick') {
-      const digit = getLastDigit(data.tick.quote, state.pipSize);
-
-      state.quote = data.tick.quote;
-      state.lastDigit = digit;
-
-      state.statsBuffer.push(digit);
-      if (state.statsBuffer.length > 100) state.statsBuffer.shift();
-
-      state.history.push(digit);
-      if (state.history.length > 6) state.history.shift();
-
-      refreshRuntimeState();
-
-      if (cooldown > 0) {
-        cooldown--;
-        refreshRuntimeState();
-        emitState();
+    // Authorization
+    if (msg.msg_type === 'authorize') {
+      if (msg.error) {
+        log(`❌ Auth failed: ${msg.error.message}`);
+        setTimeout(connect, 10000);
         return;
       }
-
-      const pct0 = getDigitPercent(0);
-      const pct1 = getDigitPercent(1);
-
-      const validEntry =
-        !state.inTrade &&
-        state.statsBuffer.length >= 100 &&
-        (digit === 0 || digit === 1) &&
-        pct0 < 10.5 &&
-        pct1 < 10.5;
-
-      if (state.running && validEntry && state.session.canTradeNow) {
-        pushLog(
-          `ENTRY → Digit ${digit} | %0:${pct0.toFixed(2)} %1:${pct1.toFixed(2)} | Stake $${state.stake.toFixed(2)}`,
-          'info'
-        );
-
-        state.inTrade = true;
-        hasTradedToday = true;
-        refreshRuntimeState();
-        emitState();
-
-        requestProposal();
-        return;
-      }
-
-      emitState();
+      log('✅ Authorized. Subscribing to continuous ticks...');
+      ws.send(JSON.stringify({ ticks: SYMBOL }));
     }
 
-    else if (data.msg_type === 'proposal') {
-      if (!state.inTrade) return;
-
-      pendingProposal = data.proposal.id;
-
-      derivWs.send(
-        JSON.stringify({
-          buy: pendingProposal,
-          price: state.stake
-        })
-      );
+    // Keep latestSpot always up‑to‑date
+    if (msg.msg_type === 'tick') {
+      latestSpot = msg.tick.quote;
     }
 
-    else if (data.msg_type === 'buy') {
-      pushLog(`BUY placed | Contract ${data.buy.contract_id} | Stake $${state.stake.toFixed(2)}`, 'info');
-
-      derivWs.send(
-        JSON.stringify({
-          proposal_open_contract: 1,
-          contract_id: data.buy.contract_id,
-          subscribe: 1
-        })
-      );
-    }
-
-    else if (data.msg_type === 'proposal_open_contract') {
-      const c = data.proposal_open_contract;
-      if (!c.is_sold) return;
-
-      const profit = parseFloat(c.profit);
-
-      state.pnl = round2(state.pnl + profit);
-      state.inTrade = false;
-
-      if (state.pnl >= TP_TARGET) {
-        pushLog(`TP HIT +${state.pnl.toFixed(2)} → STOP BOT`, 'success');
-        state.running = false;
-      }
-
-      if (profit > 0) {
-        state.wins++;
-        state.stepIndex = 0;
-        state.stake = MARTINGALE_STEPS[0];
-
-        pushLog(`WIN +${profit.toFixed(2)} → Reset to Step 1`, 'success');
+    // Trade confirmation
+    if (msg.msg_type === 'buy') {
+      if (msg.error) {
+        log(`❌ Trade Error: ${msg.error.message}`);
       } else {
-        state.losses++;
-        state.stepIndex++;
-        cooldown = 3;
-
-        pushLog(`LOSS ${profit.toFixed(2)} → Cooldown 3 ticks`, 'warn');
-
-        if (state.stepIndex >= MAX_STEPS) {
-          pushLog('MAX MARTINGALE STEPS HIT → STOP BOT', 'error');
-          state.running = false;
-        } else {
-          state.stake = MARTINGALE_STEPS[state.stepIndex];
-          pushLog(`Next stake → $${state.stake.toFixed(2)} | Step ${state.stepIndex + 1}/${MAX_STEPS}`, 'warn');
-        }
+        log(`✅ Trade placed: ${msg.buy.transaction_id}`);
       }
-
-      refreshRuntimeState();
-      emitState();
     }
   });
 
-  derivWs.on('close', () => {
-    state.running = false;
-    state.inTrade = false;
-    refreshRuntimeState();
-    emitState();
-
-    pushLog('Socket closed → reconnecting in 5s', 'warn');
-    setTimeout(connect, 5000);
+  ws.on('close', () => {
+    log('❌ WebSocket closed. Reconnecting in 10s...');
+    setTimeout(connect, 10000);
   });
 
-  derivWs.on('error', () => {
-    pushLog('WebSocket connection error', 'error');
+  ws.on('error', (err) => {
+    log(`❌ WebSocket error: ${err.message}`);
+    ws.close();
   });
 }
 
-function requestProposal() {
-  derivWs.send(
-    JSON.stringify({
-      proposal: 1,
-      amount: round2(state.stake),
-      basis: 'stake',
-      contract_type: 'DIGITOVER',
-      currency: 'USD',
-      duration: 1,
-      duration_unit: 't',
-      symbol: SYMBOL,
-      barrier: '1'
-    })
-  );
+// ---------- Fixed schedule: fire exactly every INTERVAL_SEC seconds ----------
+function startScheduler() {
+  setInterval(() => {
+    // Only trade if we have a valid price (ticks have started arriving)
+    if (latestSpot === null) {
+      log('⏳ No tick received yet – skipping trade this cycle');
+      return;
+    }
+
+    // Round to 2 decimals as required by Deriv API
+    const entryPrice = Math.round(parseFloat(latestSpot) * 100) / 100;
+    log(`⏰ Scheduled trade – Spot: ${latestSpot} → Entry: ${entryPrice}`);
+
+    placeContracts(entryPrice);
+  }, INTERVAL_SEC * 1000);
 }
 
-io.on('connection', (socket) => {
-  refreshRuntimeState();
-  socket.emit('update', state);
-  socket.emit('log', {
-    ts: new Date().toISOString(),
-    level: 'info',
-    message: 'Dashboard connected'
-  });
-});
+// ---------- Place one Higher + one Lower contract ----------
+function placeContracts(entryPrice) {
+  const base = {
+    symbol: SYMBOL,
+    duration: 5,
+    duration_unit: 't',
+    basis: 'stake',
+    currency: 'USD',
+    amount: STAKE
+  };
 
-app.use(express.static(path.join(__dirname, 'public')));
+  // Higher
+  ws.send(JSON.stringify({
+    buy: 1,
+    price: entryPrice,
+    parameters: { ...base, contract_type: 'CALL', barrier: `+${OFFSET}` }
+  }));
 
-server.listen(PORT, () => {
-  console.log(`Server running on ${PORT}`);
-  connect();
-});
+  // Lower
+  ws.send(JSON.stringify({
+    buy: 1,
+    price: entryPrice,
+    parameters: { ...base, contract_type: 'PUT', barrier: `-${OFFSET}` }
+  }));
+}
+
+// ---------- Start everything ----------
+if (!TOKEN) {
+  log('❌ DERIV_TOKEN missing. Exiting.');
+  process.exit(1);
+}
+
+connect();
+startScheduler(); // the scheduler runs independently of connection state
